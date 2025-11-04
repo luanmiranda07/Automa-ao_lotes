@@ -3,6 +3,8 @@ from datetime import date
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
+import unicodedata, re, difflib
+import numpy as np
 
 # ------------------------------
 # CONFIGURAÇÃO: ARQUIVO MODELO PADRÃO
@@ -14,49 +16,106 @@ ARQUIVO_MODELO = "testesLotes.xlsx"
 # Funções de leitura e geração
 # ------------------------------
 
+def _norm(s: str) -> str:
+    """Normaliza string: remove NBSP, trim, colapsa espaços, remove acentos, lower."""
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace("\u00A0", " ")            # NBSP -> espaço normal
+    s = re.sub(r"\s+", " ", s).strip()      # colapsa e tira espaços nas pontas
+    s_nfkd = unicodedata.normalize("NFKD", s)
+    s_noacc = "".join(c for c in s_nfkd if not unicodedata.combining(c))
+    return s_noacc.lower()
+
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica strip/colapso de espaço em todos os cabeçalhos."""
+    df = df.copy()
+    new_cols = []
+    for c in df.columns:
+        cs = str(c).replace("\u00A0", " ")
+        cs = re.sub(r"\s+", " ", cs).strip()
+        new_cols.append(cs)
+    df.columns = new_cols
+    return df
+
+def _find_best_column(df: pd.DataFrame, user_text: str | None) -> str | None:
+    """Tenta mapear o texto digitado pelo usuário para uma coluna do df."""
+    if not user_text:
+        return None
+
+    cols = list(df.columns)
+    # 1) Igualdade direta
+    if user_text in cols:
+        return user_text
+
+    # 2) Igualdade case-insensitive + strip
+    us = user_text.replace("\u00A0", " ").strip()
+    for c in cols:
+        if c.replace("\u00A0", " ").strip().lower() == us.lower():
+            return c
+
+    # 3) Sem acentos
+    col_norm_map = {_norm(c): c for c in cols}
+    usn = _norm(user_text)
+    if usn in col_norm_map:
+        return col_norm_map[usn]
+
+    # 4) Fuzzy match (normalizado)
+    match = difflib.get_close_matches(usn, list(col_norm_map.keys()), n=1, cutoff=0.8)
+    if match:
+        return col_norm_map[match[0]]
+
+    # 5) Substring (normalizado)
+    for kn, orig in col_norm_map.items():
+        if usn in kn or kn in usn:
+            return orig
+
+    return None
+
+
+
 def carregar_lote(caminho_lote: str, nome_coluna_processo: str | None = None) -> pd.DataFrame:
     """
     Lê a planilha LOTE e tenta descobrir automaticamente qual linha é o cabeçalho.
     - Primeiro tenta achar a linha onde está a coluna do processo.
     - Se não achar, pega a primeira linha "cheia" de dados como cabeçalho.
+    Em seguida, normaliza os cabeçalhos (strip/colapso de espaços).
     """
     raw = pd.read_excel(caminho_lote, header=None)
 
-    # Normaliza o nome da coluna de processo (se informado)
-    if nome_coluna_processo:
-        alvo = nome_coluna_processo.strip().lower()
-    else:
-        # valor padrão caso não seja informado
-        alvo = "número do processo"
+    alvo = (nome_coluna_processo.strip().lower() if nome_coluna_processo
+            else "número do processo")
 
     header_row_idx = None
 
-    # 1) Tenta achar a linha onde aparece a coluna do processo
+    # 1) Pela coluna de processo
     for i, row in raw.iterrows():
         linha_str = row.astype(str).str.strip().str.lower()
         if linha_str.eq(alvo).any():
             header_row_idx = i
             break
 
-    # 2) Se não encontrou pela coluna de processo, usa um fallback:
-    #    pega a primeira linha com "várias" células não vazias
+    # 2) Fallback: primeira linha "cheia"
     if header_row_idx is None:
         for i, row in raw.iterrows():
-            # row.count() conta valores NÃO nulos
-            if row.count() >= 3:  # você pode ajustar esse número se quiser
+            if row.count() >= 3:
                 header_row_idx = i
                 break
 
     if header_row_idx is None:
         raise ValueError("Não consegui localizar automaticamente a linha de cabeçalho no arquivo de lote.")
 
-    # Monta o DataFrame a partir do cabeçalho encontrado
     header = raw.iloc[header_row_idx]
     dados = raw.iloc[header_row_idx + 1:].copy()
     dados.columns = header
     dados = dados.dropna(axis=1, how="all").dropna(how="all")
 
+    # >>> NORMALIZA CABEÇALHOS (remove espaços/acentos problemáticos)
+    dados = _normalize_headers(dados)
+
     return dados
+
 
 
 
@@ -70,23 +129,27 @@ def montar_saida(dados_lote, colunas_modelo, coluna_processo,
                  evento_integracao_val, evento_map, solicitado_por):
     """
     Cria o DataFrame de saída com base no evento informado,
-    usando os nomes de colunas informados pelo usuário.
+    usando os nomes de colunas informados pelo usuário, com correspondência robusta.
     """
     saida = pd.DataFrame(columns=colunas_modelo)
 
     # PROCESSO
-    if coluna_processo and coluna_processo in dados_lote.columns:
-        saida["PROCESSO"] = dados_lote[coluna_processo].values
+    col_proc = _find_best_column(dados_lote, coluna_processo)
+    if col_proc:
+        saida["PROCESSO"] = dados_lote[col_proc].values
+        print(f"PROCESSO <- '{col_proc}'")
     else:
         print(f"⚠️ Coluna de processo '{coluna_processo}' não encontrada no lote.")
 
     # EVENTO (valor financeiro/coluna específica do lote)
     if evento_integracao_val in evento_map:
-        coluna_origem = evento_map[evento_integracao_val]
-        if coluna_origem and coluna_origem in dados_lote.columns:
-            saida["EVENTO"] = dados_lote[coluna_origem].values
+        coluna_origem_digitada = evento_map[evento_integracao_val]
+        col_evt = _find_best_column(dados_lote, coluna_origem_digitada)
+        if col_evt:
+            saida["EVENTO"] = dados_lote[col_evt].values
+            print(f"EVENTO[{evento_integracao_val}] <- '{col_evt}' (entrada: '{coluna_origem_digitada}')")
         else:
-            print(f"⚠️ Coluna '{coluna_origem}' não encontrada no lote para o evento {evento_integracao_val}.")
+            print(f"⚠️ Coluna '{coluna_origem_digitada}' não encontrada no lote para o evento {evento_integracao_val}.")
     else:
         print(f"⚠️ Evento '{evento_integracao_val}' não está mapeado.")
 
@@ -107,6 +170,7 @@ def montar_saida(dados_lote, colunas_modelo, coluna_processo,
         saida["EVENTO_INTEGRACAO"] = evento_integracao_val
 
     return saida
+
 
 
 def gerar_arquivos():
