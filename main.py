@@ -14,14 +14,50 @@ ARQUIVO_MODELO = "testesLotes.xlsx"
 # Funções de leitura e geração
 # ------------------------------
 
-def carregar_lote(caminho_lote: str) -> pd.DataFrame:
-    """Lê a planilha LOTE e arruma o cabeçalho (linha 4 como header)."""
+def carregar_lote(caminho_lote: str, nome_coluna_processo: str | None = None) -> pd.DataFrame:
+    """
+    Lê a planilha LOTE e tenta descobrir automaticamente qual linha é o cabeçalho.
+    - Primeiro tenta achar a linha onde está a coluna do processo.
+    - Se não achar, pega a primeira linha "cheia" de dados como cabeçalho.
+    """
     raw = pd.read_excel(caminho_lote, header=None)
-    header = raw.iloc[3]      # linha 4 é o cabeçalho
-    dados = raw.iloc[4:].copy()
+
+    # Normaliza o nome da coluna de processo (se informado)
+    if nome_coluna_processo:
+        alvo = nome_coluna_processo.strip().lower()
+    else:
+        # valor padrão caso não seja informado
+        alvo = "número do processo"
+
+    header_row_idx = None
+
+    # 1) Tenta achar a linha onde aparece a coluna do processo
+    for i, row in raw.iterrows():
+        linha_str = row.astype(str).str.strip().str.lower()
+        if linha_str.eq(alvo).any():
+            header_row_idx = i
+            break
+
+    # 2) Se não encontrou pela coluna de processo, usa um fallback:
+    #    pega a primeira linha com "várias" células não vazias
+    if header_row_idx is None:
+        for i, row in raw.iterrows():
+            # row.count() conta valores NÃO nulos
+            if row.count() >= 3:  # você pode ajustar esse número se quiser
+                header_row_idx = i
+                break
+
+    if header_row_idx is None:
+        raise ValueError("Não consegui localizar automaticamente a linha de cabeçalho no arquivo de lote.")
+
+    # Monta o DataFrame a partir do cabeçalho encontrado
+    header = raw.iloc[header_row_idx]
+    dados = raw.iloc[header_row_idx + 1:].copy()
     dados.columns = header
     dados = dados.dropna(axis=1, how="all").dropna(how="all")
+
     return dados
+
 
 
 def carregar_modelo(caminho_modelo: str) -> list:
@@ -134,7 +170,7 @@ def gerar_arquivos():
                 solicitado_por=solicitado_por,
             )
 
-            arquivo_saida = pasta_saida / f"{nome_base}_{evento}_preenchido.xlsx"
+            arquivo_saida = pasta_saida / f"1 Cópia de modelo rb 03 - {evento} preenchido.xlsx"
             saida.to_excel(arquivo_saida, index=False)
             print(f"✅ Arquivo gerado: {arquivo_saida}")
 
